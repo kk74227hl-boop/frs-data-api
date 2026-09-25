@@ -8,66 +8,208 @@ from fastapi import FastAPI, HTTPException, Query
 
 app = FastAPI(
     title="FRS Data API",
-    version="1.0.0",
-    description="Normalized market data API for FRS."
+    version="1.1.0",
+    description="Normalized market data API for FRS V31.1."
 )
+
+
+# ---------------------------------------------------------
+# Time helpers
+# ---------------------------------------------------------
+
+def now_utc():
+    return datetime.now(timezone.utc)
 
 
 def now_ms():
     return int(time.time() * 1000)
 
 
-def iso_from_ms(ms: Optional[int]):
-    if not ms:
+def parse_provider_timestamp(value):
+    """
+    Supports:
+    - ISO 8601 string
+    - Unix seconds
+    - Unix milliseconds
+    - Unix microseconds
+    """
+    if value is None:
         return None
-    return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).isoformat()
+
+    try:
+        if isinstance(value, (int, float)):
+            value = float(value)
+
+            # seconds
+            if value < 10_000_000_000:
+                return datetime.fromtimestamp(
+                    value,
+                    tz=timezone.utc
+                )
+
+            # milliseconds
+            if value < 10_000_000_000_000:
+                return datetime.fromtimestamp(
+                    value / 1000,
+                    tz=timezone.utc
+                )
+
+            # microseconds
+            return datetime.fromtimestamp(
+                value / 1_000_000,
+                tz=timezone.utc
+            )
+
+        if isinstance(value, str):
+            text = value.strip()
+
+            # numeric string
+            try:
+                numeric = float(text)
+
+                if numeric < 10_000_000_000:
+                    return datetime.fromtimestamp(
+                        numeric,
+                        tz=timezone.utc
+                    )
+
+                if numeric < 10_000_000_000_000:
+                    return datetime.fromtimestamp(
+                        numeric / 1000,
+                        tz=timezone.utc
+                    )
+
+                return datetime.fromtimestamp(
+                    numeric / 1_000_000,
+                    tz=timezone.utc
+                )
+
+            except ValueError:
+                pass
+
+            # ISO timestamp
+            dt = datetime.fromisoformat(
+                text.replace("Z", "+00:00")
+            )
+
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+
+            return dt.astimezone(timezone.utc)
+
+    except Exception:
+        return None
+
+    return None
 
 
-def status_from_age(age_seconds: Optional[float]):
+def timestamp_to_iso(value):
+    dt = parse_provider_timestamp(value)
+
+    if not dt:
+        return None
+
+    return dt.isoformat()
+
+
+def calculate_age_seconds(value):
+    dt = parse_provider_timestamp(value)
+
+    if not dt:
+        return None
+
+    age = (
+        now_utc() - dt
+    ).total_seconds()
+
+    return max(0, age)
+
+
+# ---------------------------------------------------------
+# FRS hard status rules
+# ---------------------------------------------------------
+
+def determine_status(age_seconds):
+    """
+    FRS hard rule:
+
+    LIVE_VERIFIED:
+        Fresh provider timestamp <= 120 seconds.
+
+    STALE:
+        Timestamp exists but is older than 120 seconds.
+
+    UNAVAILABLE:
+        No valid provider timestamp.
+
+    API_ERROR:
+        Provider request failed.
+    """
+
     if age_seconds is None:
         return "UNAVAILABLE"
+
     if age_seconds <= 120:
         return "LIVE_VERIFIED"
-    if age_seconds <= 900:
-        return "STALE"
+
     return "STALE"
 
+
+def t0_allowed(status):
+    return status == "LIVE_VERIFIED"
+
+
+# ---------------------------------------------------------
+# Health
+# ---------------------------------------------------------
 
 @app.get("/health")
 def health():
     return {
         "status": "ok",
         "service": "FRS Data API",
-        "version": "1.0.0",
-        "timestamp": datetime.now(timezone.utc).isoformat()
+        "version": "1.1.0",
+        "timestamp": now_utc().isoformat()
     }
 
 
+# ---------------------------------------------------------
+# Finnhub - US
+# ---------------------------------------------------------
+
 def get_finnhub_quote(symbol: str):
+
     api_key = os.getenv("FINNHUB_API_KEY")
 
     if not api_key:
         return {
-            "symbol": symbol,
+            "symbol": symbol.upper(),
             "market": "US",
             "status": "API_ERROR",
             "error": "FINNHUB_API_KEY is not configured"
         }
 
-    url = "https://finnhub.io/api/v1/quote"
+    try:
+        response = requests.get(
+            "https://finnhub.io/api/v1/quote",
+            params={
+                "symbol": symbol.upper(),
+                "token": api_key
+            },
+            timeout=10
+        )
 
-    response = requests.get(
-        url,
-        params={
+    except requests.RequestException as exc:
+        return {
             "symbol": symbol.upper(),
-            "token": api_key
-        },
-        timeout=10
-    )
+            "market": "US",
+            "status": "API_ERROR",
+            "error": str(exc)
+        }
 
     if response.status_code != 200:
         return {
-            "symbol": symbol,
+            "symbol": symbol.upper(),
             "market": "US",
             "status": "API_ERROR",
             "error": f"Finnhub HTTP {response.status_code}"
@@ -76,9 +218,9 @@ def get_finnhub_quote(symbol: str):
     data = response.json()
 
     price = data.get("c")
-    timestamp = data.get("t")
+    provider_timestamp = data.get("t")
 
-    if not price or not timestamp:
+    if price is None:
         return {
             "symbol": symbol.upper(),
             "market": "US",
@@ -86,8 +228,11 @@ def get_finnhub_quote(symbol: str):
             "source": "FINNHUB"
         }
 
-    provider_ms = int(timestamp) * 1000
-    age = max(0, (now_ms() - provider_ms) / 1000)
+    age = calculate_age_seconds(
+        provider_timestamp
+    )
+
+    status = determine_status(age)
 
     return {
         "symbol": symbol.upper(),
@@ -102,15 +247,28 @@ def get_finnhub_quote(symbol: str):
         "vwap": None,
         "session": "REGULAR",
         "source": "FINNHUB",
-        "provider_timestamp": iso_from_ms(provider_ms),
-        "api_received_timestamp": datetime.now(timezone.utc).isoformat(),
-        "data_age_seconds": round(age, 2),
-        "status": status_from_age(age),
-        "price_type": "LIVE"
+        "provider_timestamp": timestamp_to_iso(
+            provider_timestamp
+        ),
+        "api_received_timestamp": now_utc().isoformat(),
+        "data_age_seconds": (
+            round(age, 2)
+            if age is not None
+            else None
+        ),
+        "status": status,
+        "price_type": "LIVE" if status == "LIVE_VERIFIED"
+        else "HISTORICAL",
+        "t0_allowed": t0_allowed(status)
     }
 
 
+# ---------------------------------------------------------
+# Fugle - Taiwan
+# ---------------------------------------------------------
+
 def get_fugle_quote(symbol: str):
+
     api_key = os.getenv("FUGLE_API_KEY")
 
     if not api_key:
@@ -127,13 +285,22 @@ def get_fugle_quote(symbol: str):
         f"{symbol}"
     )
 
-    response = requests.get(
-        url,
-        headers={
-            "X-API-KEY": api_key
-        },
-        timeout=10
-    )
+    try:
+        response = requests.get(
+            url,
+            headers={
+                "X-API-KEY": api_key
+            },
+            timeout=10
+        )
+
+    except requests.RequestException as exc:
+        return {
+            "symbol": symbol,
+            "market": "TW",
+            "status": "API_ERROR",
+            "error": str(exc)
+        }
 
     if response.status_code != 200:
         return {
@@ -145,12 +312,12 @@ def get_fugle_quote(symbol: str):
 
     data = response.json()
 
-    # Fugle may return quote data inside different wrappers.
     quote = data.get("data", data)
 
     price = (
         quote.get("lastPrice")
-        or quote.get("closePrice")
+        if quote.get("lastPrice") is not None
+        else quote.get("closePrice")
     )
 
     if price is None:
@@ -161,21 +328,15 @@ def get_fugle_quote(symbol: str):
             "source": "FUGLE"
         }
 
-    last_updated = quote.get("lastUpdated")
+    provider_timestamp = quote.get(
+        "lastUpdated"
+    )
 
-    age = None
+    age = calculate_age_seconds(
+        provider_timestamp
+    )
 
-    if last_updated:
-        try:
-            dt = datetime.fromisoformat(
-                last_updated.replace("Z", "+00:00")
-            )
-            age = (
-                datetime.now(timezone.utc) - dt
-            ).total_seconds()
-            age = max(0, age)
-        except Exception:
-            age = None
+    status = determine_status(age)
 
     return {
         "symbol": symbol,
@@ -190,19 +351,32 @@ def get_fugle_quote(symbol: str):
         "vwap": quote.get("avgPrice"),
         "session": "REGULAR",
         "source": "FUGLE",
-        "provider_timestamp": last_updated,
-        "api_received_timestamp": datetime.now(timezone.utc).isoformat(),
-        "data_age_seconds": round(age, 2) if age is not None else None,
-        "status": status_from_age(age),
-        "price_type": "LIVE"
+        "provider_timestamp": timestamp_to_iso(
+            provider_timestamp
+        ),
+        "api_received_timestamp": now_utc().isoformat(),
+        "data_age_seconds": (
+            round(age, 2)
+            if age is not None
+            else None
+        ),
+        "status": status,
+        "price_type": "LIVE" if status == "LIVE_VERIFIED"
+        else "HISTORICAL",
+        "t0_allowed": t0_allowed(status)
     }
 
+
+# ---------------------------------------------------------
+# Quote
+# ---------------------------------------------------------
 
 @app.get("/v1/quote")
 def quote(
     symbol: str = Query(...),
     market: str = Query(...)
 ):
+
     market = market.upper()
 
     if market == "US":
@@ -217,11 +391,16 @@ def quote(
     )
 
 
+# ---------------------------------------------------------
+# Batch quotes
+# ---------------------------------------------------------
+
 @app.get("/v1/batch-quotes")
 def batch_quotes(
     symbols: str = Query(...),
     market: str = Query(...)
 ):
+
     market = market.upper()
 
     symbol_list = [
@@ -233,10 +412,17 @@ def batch_quotes(
     results = []
 
     for symbol in symbol_list:
+
         if market == "US":
-            results.append(get_finnhub_quote(symbol))
+            results.append(
+                get_finnhub_quote(symbol)
+            )
+
         elif market == "TW":
-            results.append(get_fugle_quote(symbol))
+            results.append(
+                get_fugle_quote(symbol)
+            )
+
         else:
             raise HTTPException(
                 status_code=400,
@@ -250,10 +436,15 @@ def batch_quotes(
     }
 
 
+# ---------------------------------------------------------
+# Market status
+# ---------------------------------------------------------
+
 @app.get("/v1/market-status")
 def market_status(
     market: str = Query(...)
 ):
+
     market = market.upper()
 
     if market not in ["TW", "US"]:
@@ -265,26 +456,35 @@ def market_status(
     return {
         "market": market,
         "status": "UNKNOWN",
-        "note": "Market-status provider integration will be added in the next FRS API version."
+        "note": "Market-status integration will be added in a later FRS API version."
     }
 
+
+# ---------------------------------------------------------
+# FRS Context
+# ---------------------------------------------------------
 
 @app.get("/v1/frs-context")
 def frs_context(
     symbol: str = Query(...),
     market: str = Query(...)
 ):
+
     market = market.upper()
 
     if market == "US":
         quote_data = get_finnhub_quote(symbol)
+
     elif market == "TW":
         quote_data = get_fugle_quote(symbol)
+
     else:
         raise HTTPException(
             status_code=400,
             detail="market must be TW or US"
         )
+
+    status = quote_data.get("status")
 
     return {
         "frs_version": "FRS V31.1-T1-PRO-CANONICAL",
@@ -292,10 +492,21 @@ def frs_context(
         "market": market,
         "quote": quote_data,
         "t0_allowed": (
-            quote_data.get("status") == "LIVE_VERIFIED"
+            status == "LIVE_VERIFIED"
         ),
+        "execution_gate": {
+            "status": status,
+            "executable_t0": (
+                status == "LIVE_VERIFIED"
+            ),
+            "blocked_statuses": [
+                "STALE",
+                "API_ERROR",
+                "UNAVAILABLE"
+            ]
+        },
         "hard_rule": (
-            "STALE/API_ERROR/UNAVAILABLE cannot be used "
-            "as FRS T0 live price."
+            "Only LIVE_VERIFIED may be used "
+            "as an executable FRS T0 live price."
         )
     }
